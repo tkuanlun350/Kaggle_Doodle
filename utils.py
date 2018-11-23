@@ -23,7 +23,7 @@ def draw_cv2(raw_strokes, size=256, lw=6, time_color=True):
 def image_generator_xd(size, batchsize, ks, lw=6, time_color=True):
     while True:
         for k in np.random.permutation(ks):
-            filename = os.path.join('/data/kaggle/doodle/shuffle_csv/train_k{}.csv.gz'.format(k))
+            filename = os.path.join('/data/kaggle/doodle/shuffle_csv2/train_k{}.csv.gz'.format(k))
             for df in pd.read_csv(filename, chunksize=batchsize):
                 df['drawing'] = df['drawing'].apply(ast.literal_eval)
                 x = np.zeros((len(df), size, size, 1))

@@ -40,6 +40,7 @@ import pandas as pd
 from utils import *
 from tensorflow.python.keras.metrics import categorical_accuracy, top_k_categorical_accuracy
 from tensorflow import keras
+from custom_utils import ReduceLearningRateOnPlateau
 
 NCSVS = 100
 
@@ -68,11 +69,11 @@ def image_generator(csv_file, label_map, batchsize=config.BATCH, image_size=conf
 def get_train_dataflow():
     train_datagen = image_generator_xd(size=config.IMAGE_SIZE, batchsize=config.BATCH, ks=range(NCSVS - 1))
     ds = DataFromGenerator(train_datagen)
-    ds = PrefetchDataZMQ(ds, 6)
+    #ds = PrefetchDataZMQ(ds, 6)
     return ds
 
 def get_eval_dataflow():
-    valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/shuffle_csv/train_k{}.csv.gz'.format(NCSVS - 1)), nrows=34000)
+    valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/shuffle_csv2/train_k{}.csv.gz'.format(NCSVS - 1)), nrows=34000)
     x_valid = df_to_image_array_xd(valid_df, size)
     y_valid = keras.utils.to_categorical(valid_df.y, num_classes=config.NUM_CLASS)
     return x_valid, y_valid
@@ -93,7 +94,7 @@ class ResnetModel(ModelDesc):
         image = image * (1.0 / 255)
         image = tf.transpose(image, [0, 3, 1, 2])
         
-        depth = 18
+        depth = 50
         basicblock = preresnet_basicblock if config.RESNET_MODE == 'preact' else resnet_basicblock
         bottleneck = {
             'resnet': resnet_bottleneck,
@@ -146,25 +147,13 @@ class ResnetModel(ModelDesc):
         #opt = tf.train.MomentumOptimizer(lr, 0.9)
         return opt
 
-
-class MyEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        else:
-            return super(MyEncoder, self).default(obj)
-
 class ResnetEvalCallback(Callback):
     
     def _setup_graph(self):
         self.pred = self.trainer.get_predictor(
             ['image'],
             get_resnet_model_output_names())
-        valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/shuffle_csv/train_k{}.csv.gz'.format(NCSVS - 1)), nrows=34000)
+        valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/shuffle_csv2/train_k{}.csv.gz'.format(NCSVS - 1)), nrows=34000)
         x_valid = df_to_image_array_xd(valid_df, config.IMAGE_SIZE)
         y_valid = keras.utils.to_categorical(valid_df.y, num_classes=config.NUM_CLASS)
         self.data = [x_valid, y_valid]
@@ -193,6 +182,8 @@ class ResnetEvalCallback(Callback):
         valid_predictions = np.array(valid_predictions)
         map3 = mapk(self.valid_df[['y']].values, preds2catids(valid_predictions).values)
         print('Map3: {:.3f}'.format(map3))
+        #loss = tf.get_default_graph().get_tensor_by_name("tower0/cls_loss/label_loss:0")
+        #print("train loss: ", loss.eval())
         self.trainer.monitors.put_scalar("Map3", map3)
 
     def _trigger_epoch(self):
@@ -210,6 +201,7 @@ if __name__ == '__main__':
     parser.add_argument('--predict', help='path to the input image file')
     parser.add_argument('--lr_find', action='store_true')
     parser.add_argument('--cyclic', action='store_true')
+    parser.add_argument('--auto_reduce', action='store_true')
     args = parser.parse_args()
     if args.datadir:
         config.BASEDIR = args.datadir
@@ -237,7 +229,7 @@ if __name__ == '__main__':
                         input_names=['image'],
                         output_names=get_resnet_model_output_names()))
                     
-                    valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/shuffle_csv/train_k{}.csv.gz'.format(NCSVS - 1)), nrows=34000)
+                    valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/shuffle_csv2/train_k{}.csv.gz'.format(NCSVS - 1)), nrows=34000)
                     x_valid = df_to_image_array_xd(valid_df, config.IMAGE_SIZE)
                     y_valid = keras.utils.to_categorical(valid_df.y, num_classes=config.NUM_CLASS)
                     valid_predictions = []
@@ -305,17 +297,24 @@ if __name__ == '__main__':
                 base_lr = 0.0001
                 max_lr = 0.004
                 step_size = (180000 // 64) * 2
-            # Current 60000 steps to reach 0.7 LB
             stepnum = 5000 # step to save model and eval
             max_epoch = 20 # how many cycle / 4 = 5 cycle (2*step_size = 1 cycle)
             CYCLIC_SCHEDULE = CyclicLearningRateSetter('learning_rate', base_lr=base_lr, max_lr=max_lr, step_size=step_size)
             TRAINING_SCHEDULE = CYCLIC_SCHEDULE
+        elif args.auto_reduce:
+            stepnum = 800
+            base_lr = 2e-3
+            min_lr = 1e-5
+            max_epoch = 120
+            TRAINING_SCHEDULE = ReduceLearningRateOnPlateau('learning_rate', 
+                                        factor=0.1, patience=5, 
+                                        base_lr=base_lr, min_lr=min_lr, window_size=800)
         else:
             # heuristic setting for baseline
             if config.RESNET:
                 stepnum = 800
-                max_epoch = 50
-                TRAINING_SCHEDULE = ScheduledHyperParamSetter('learning_rate', [(0, 2e-3), (20, 1e-3), (40, 1e-4)])
+                max_epoch = 120
+                TRAINING_SCHEDULE = ScheduledHyperParamSetter('learning_rate', [(0, 2e-3), (40, 1e-3), (80, 1e-4)])
 
         #==========LR Range Test===============#
         if config.RESNET:
