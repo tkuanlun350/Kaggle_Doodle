@@ -5,8 +5,9 @@ import tensorflow as tf
 
 from tensorpack.tfutils.argscope import argscope, get_arg_scope
 from tensorpack.models import (
-    Conv2D, MaxPooling, GlobalAvgPooling, BatchNorm, BNReLU, FullyConnected)
+    Dropout, Conv2D, MaxPooling, GlobalAvgPooling, BatchNorm, BNReLU, FullyConnected)
 import config
+import math
 
 def resnet_shortcut(l, n_out, stride, activation=tf.identity):
     data_format = get_arg_scope()['Conv2D']['data_format']
@@ -87,9 +88,17 @@ def resnet_bottleneck(l, ch_out, stride, stride_first=False):
 
 def se_resnet_bottleneck(l, ch_out, stride):
     shortcut = l
-    l = Conv2D('conv1', l, ch_out, 1, activation=BNReLU)
-    l = Conv2D('conv2', l, ch_out, 3, strides=stride, activation=BNReLU)
-    l = Conv2D('conv3', l, ch_out * 4, 1, activation=get_bn(zero_init=True))
+    if config.RESNET == 'ResXt':
+        baseWidth = 4
+        D = int(math.floor(ch_out * (baseWidth / 64.0)))
+        C = 32
+        l = Conv2D('conv1', l, D*C, 1, activation=BNReLU)
+        l = Conv2D('conv2', l, D*C, 3, stride=stride, split=C, activation=BNReLU)
+        l = Conv2D('conv3', l, ch_out*4, 1, stride=1, activation=get_bn(zero_init=True))
+    else:
+        l = Conv2D('conv1', l, ch_out, 1, activation=BNReLU)
+        l = Conv2D('conv2', l, ch_out, 3, strides=stride, activation=BNReLU)
+        l = Conv2D('conv3', l, ch_out * 4, 1, activation=get_bn(zero_init=True))
 
     squeeze = GlobalAvgPooling('gap', l)
     squeeze = FullyConnected('fc1', squeeze, ch_out // 4, activation=tf.nn.relu)
@@ -124,5 +133,23 @@ def resnet_backbone(image, num_blocks, group_func, block_func):
         l = group_func('group3', l, block_func, 512, num_blocks[3], 2)
         l = GlobalAvgPooling('gap', l)
         logits = FullyConnected('linear', l, config.NUM_CLASS,
+                                kernel_initializer=tf.random_normal_initializer(stddev=0.01))
+    return logits
+
+def resnet_backbone_dropout(image, num_blocks, group_func, block_func):
+    with argscope(Conv2D, use_bias=False,
+                  kernel_initializer=tf.variance_scaling_initializer(scale=2.0, mode='fan_out')):
+        # Note that this pads the image by [2, 3] instead of [3, 2].
+        # Similar things happen in later stride=2 layers as well.
+        l = Conv2D('conv0', image, 64, 7, strides=2, activation=BNReLU)
+        l = MaxPooling('pool0', l, pool_size=3, strides=2, padding='SAME')
+        l = group_func('group0', l, block_func, 64, num_blocks[0], 1)
+        if config.FREEZE:
+            l = tf.stop_gradient(l)
+        l = group_func('group1', l, block_func, 128, num_blocks[1], 2)
+        l = group_func('group2', l, block_func, 256, num_blocks[2], 2)
+        l = group_func('group3', l, block_func, 512, num_blocks[3], 2)
+        l = GlobalAvgPooling('gap', l) # B*7*7*512 -> b*1*1*512
+        logits = FullyConnected('linear_1', l, config.NUM_CLASS,
                                 kernel_initializer=tf.random_normal_initializer(stddev=0.01))
     return logits

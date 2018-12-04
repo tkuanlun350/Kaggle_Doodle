@@ -11,7 +11,7 @@ from tensorpack.tfutils.scope_utils import under_name_scope
 from tensorpack.models import ( 
     MaxPooling, BatchNorm, Conv2DTranspose, BNReLU, Conv2D, FullyConnected, GlobalAvgPooling, layer_register, Deconv2D, Dropout)
 from resnet_model import (
-    preresnet_group, preresnet_basicblock, preresnet_bottleneck,
+    resnet_backbone_dropout, preresnet_group, preresnet_basicblock, preresnet_bottleneck,
     resnet_group, resnet_basicblock, resnet_bottleneck, se_resnet_bottleneck,
     resnet_backbone)
 import numpy as np
@@ -21,7 +21,7 @@ from tensorflow.python.keras.metrics import categorical_accuracy, top_k_categori
 
 def get_logit(image, num_blocks, block_func):
     with argscope([Conv2D, MaxPooling, GlobalAvgPooling, BatchNorm], data_format="NCHW"):
-            return resnet_backbone(
+            return resnet_backbone_dropout(
                 image, num_blocks,
                 preresnet_group if config.RESNET_MODE == 'preact' else resnet_group, block_func)
 

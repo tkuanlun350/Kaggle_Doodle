@@ -23,7 +23,7 @@ from tensorpack.tfutils import optimizer
 import tensorpack.utils.viz as tpviz
 from tensorpack.utils.gpu import get_nr_gpu
 from tensorpack.dataflow import (
-    DataFromGenerator, MapData, imgaug, AugmentImageComponent, TestDataSpeed, MultiProcessMapData,
+    DataFlow, RNGDataFlow, DataFromGenerator, MapData, imgaug, AugmentImageComponent, TestDataSpeed, MultiProcessMapData,
     MapDataComponent, DataFromList, PrefetchDataZMQ, BatchData)
 
 from resnet_model import (
@@ -44,6 +44,66 @@ from custom_utils import ReduceLearningRateOnPlateau
 
 NCSVS = 100
 
+def image_generator_xd2(size, batchsize, ks, lw=6, time_color=True):
+    while True:
+        for k in ks:
+            filename = os.path.join('/data/kaggle/doodle/{}/train_k{}.csv.gz'.format(config.FOLD, k))
+            main_df = pd.read_csv(filename)
+            for step in range(len(main_df) // config.BATCH + 1):
+                df = main_df.sample(config.BATCH)
+            #for df in pd.read_csv(filename, chunksize=batchsize):
+                if not config.RAW:
+                    df['drawing'] = df['drawing'].apply(ast.literal_eval)
+                if config.SEQ:
+                    x = np.zeros((len(df), size, size, 3))
+                else:
+                    x = np.zeros((len(df), size, size, 1))
+                for i, raw_strokes in enumerate(df.drawing.values):
+                    if config.SEQ and not config.RAW:
+                        x[i] = draw_cv2_seq(raw_strokes, size=size, lw=lw,
+                                            time_color=time_color, padding=config.PADDING)
+                    elif config.RAW:
+                        _raw_strokes = eval(raw_strokes)
+                        if config.SEQ:
+                            x[i, :, :, :] = draw_raw(_raw_strokes, size, size)
+                        else:
+                            x[i, :, :, 0] = draw_raw(_raw_strokes, size, size)
+                    else:
+                        x[i, :, :, 0] = draw_cv2(raw_strokes, size=size, lw=lw,
+                                             time_color=time_color, padding=config.PADDING)
+                x = x.astype(np.float32)
+                y = keras.utils.to_categorical(df.y, num_classes=config.NUM_CLASS)
+                yield x, y
+
+def get_rng(obj=None):
+    import os
+    from datetime import datetime, timedelta
+    seed = (id(obj) + os.getpid() +
+            int(datetime.now().strftime("%Y%m%d%H%M%S%f"))) % 4294967295
+    
+    return np.random.RandomState(seed)
+
+class DataFromGeneratorRNG(RNGDataFlow):
+    def __init__(self, size=None):
+        if size is not None:
+            log_deprecated("DataFromGenerator(size=)", "It doesn't make much sense.", "2018-03-31")
+        self.gen = None
+
+    def reset_state(self):
+        ks = list(range(NCSVS - 1))
+        self.rng = get_rng()
+        self.rng.shuffle(ks)
+        gen = image_generator_xd2(size=config.IMAGE_SIZE, batchsize=config.BATCH, ks=ks, lw=config.LW)
+        self.gen = gen
+
+    def __iter__(self):
+        # yield from
+        for dp in self.gen:
+            yield dp
+
+    def get_data(self):
+        return self.__iter__()
+
 def get_batch_factor():
     nr_gpu = get_nr_gpu()
     assert nr_gpu in [1, 2, 4, 8], nr_gpu
@@ -52,49 +112,39 @@ def get_batch_factor():
 def get_resnet_model_output_names():
     return ['final_probs', 'final_labels']
 
-def image_generator(csv_file, label_map, batchsize=config.BATCH, image_size=config.IMAGE_SIZE, lw=6):
-    while True:
-        for df in pd.read_csv(csv_file, chunksize=batchsize):
-            df['drawing'] = df['drawing'].apply(ast.literal_eval)
-            x = [] #np.zeros((len(df), size, size))
-            y = []
-            for i, raw_strokes in enumerate(df.drawing.values):
-                #x[i] = draw_cv2(raw_strokes, size=size, lw=lw)
-                x.append(drawing2tensor(list2drawing(raw_strokes, size=image_size, lw=lw)))
-            y = [label_map[x] for x in df.word.values]
-            x = np.array(x)
-            y = np.array(y)
-            yield [x, y]
-
 def get_train_dataflow():
-    train_datagen = image_generator_xd(size=config.IMAGE_SIZE, batchsize=config.BATCH, ks=range(NCSVS - 1))
+    train_datagen = image_generator_xd(size=config.IMAGE_SIZE, batchsize=config.BATCH, ks=range(NCSVS - 1), lw=config.LW)
     ds = DataFromGenerator(train_datagen)
-    #ds = PrefetchDataZMQ(ds, 6)
+    #ds = DataFromGeneratorRNG()
+    #ds = PrefetchDataZMQ(ds, 12)
     return ds
-
-def get_eval_dataflow():
-    valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/shuffle_csv2/train_k{}.csv.gz'.format(NCSVS - 1)), nrows=34000)
-    x_valid = df_to_image_array_xd(valid_df, size)
-    y_valid = keras.utils.to_categorical(valid_df.y, num_classes=config.NUM_CLASS)
-    return x_valid, y_valid
         
 class ResnetModel(ModelDesc):
     def _get_inputs(self):
-        ret = [
-            InputDesc(tf.float32, (None, None, None, 1), 'image'),
-            InputDesc(tf.int32, (None, config.NUM_CLASS), 'labels'),
-        ]
+        if config.SEQ:
+            ret = [
+                InputDesc(tf.float32, (None, None, None, 3), 'image'),
+                InputDesc(tf.int32, (None, config.NUM_CLASS), 'labels'),
+            ]
+        else:
+            ret = [
+                InputDesc(tf.float32, (None, None, None, 1), 'image'),
+                InputDesc(tf.int32, (None, config.NUM_CLASS), 'labels'),
+            ]
         return ret
 
     def _build_graph(self, inputs):
         is_training = get_current_tower_context().is_training
         image, label = inputs
-        tf.summary.image('viz', image, max_outputs=10)
+        if config.SEQ:
+            tf.summary.image('viz', image[:,:,:,0:3], max_outputs=10)
+        else:
+            tf.summary.image('viz', image, max_outputs=10)
         #image = image_preprocess(image, bgr=True)
         image = image * (1.0 / 255)
         image = tf.transpose(image, [0, 3, 1, 2])
         
-        depth = 50
+        depth = 26
         basicblock = preresnet_basicblock if config.RESNET_MODE == 'preact' else resnet_basicblock
         bottleneck = {
             'resnet': resnet_bottleneck,
@@ -102,30 +152,24 @@ class ResnetModel(ModelDesc):
             'se': se_resnet_bottleneck}[config.RESNET_MODE]
         num_blocks, block_func = {
             18: ([2, 2, 2, 2], basicblock),
-            34: ([3, 4, 6, 3], basicblock),
+            26: ([2, 2, 2, 2], bottleneck),
+            34: ([3, 4, 6, 3], bottleneck),
             50: ([3, 4, 6, 3], bottleneck),
             101: ([3, 4, 23, 3], bottleneck),
             152: ([3, 8, 36, 3], bottleneck)
         }[depth]
         logits = get_logit(image, num_blocks, block_func)
-        """
-        conv4 = pretrained_resnet_conv4(image, config.RESNET_NUM_BLOCK[:3])
-        # B*c*h*w
-        conv5 = resnet_conv5(conv4, config.RESNET_NUM_BLOCK[-1])
         
-        # train head only
-        logits = cls_head('cls', conv5)
-        """
         if is_training:
             loss = cls_loss(logits, label)
-            wd_cost = regularize_cost(
-                '.*/W',
-                l2_regularizer(1e-4), name='wd_cost')
+            #wd_cost = regularize_cost(
+            #    '.*/W',
+            #    l2_regularizer(1e-4), name='wd_cost')
 
             self.cost = tf.add_n([
-                loss, wd_cost], 'total_cost')                
+                loss], 'total_cost')                
 
-            add_moving_summary(self.cost, wd_cost)
+            add_moving_summary(self.cost)
         else:
             final_prob = tf.nn.softmax(logits)
             tf.identity(final_prob, name='final_probs')
@@ -135,15 +179,22 @@ class ResnetModel(ModelDesc):
     def _get_optimizer(self):
         lr = tf.get_variable('learning_rate', initializer=0.01, trainable=False)
         tf.summary.scalar('learning_rate', lr)
-
-        factor = get_batch_factor()
+        """
+        factor = get_batch_factor() # accumulate size
         if factor != 1:
             lr = lr / float(factor)
             opt = tf.train.MomentumOptimizer(lr, 0.9)
             opt = optimizer.AccumGradOptimizer(opt, factor)
         else:
             opt = tf.train.MomentumOptimizer(lr, 0.9)
-        opt = tf.train.AdamOptimizer(lr)
+        """
+        if config.ACCU:
+            factor = 2
+            # lr = lr / float(factor)
+            opt = tf.train.AdamOptimizer(lr)
+            opt = optimizer.AccumGradOptimizer(opt, factor)
+        else:
+            opt = tf.train.AdamOptimizer(lr)
         #opt = tf.train.MomentumOptimizer(lr, 0.9)
         return opt
 
@@ -153,19 +204,17 @@ class ResnetEvalCallback(Callback):
         self.pred = self.trainer.get_predictor(
             ['image'],
             get_resnet_model_output_names())
-        valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/shuffle_csv2/train_k{}.csv.gz'.format(NCSVS - 1)), nrows=34000)
-        x_valid = df_to_image_array_xd(valid_df, config.IMAGE_SIZE)
+        valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/{}/train_k{}.csv.gz'.format(config.FOLD, (NCSVS - 1))), nrows=34000)
+        x_valid = df_to_image_array_xd(valid_df, config.IMAGE_SIZE, lw=config.LW)
         y_valid = keras.utils.to_categorical(valid_df.y, num_classes=config.NUM_CLASS)
         self.data = [x_valid, y_valid]
         self.valid_df = valid_df
+
     def _eval(self):
         from tensorpack.utils.utils import get_tqdm_kwargs
         score = 0.0
         ind = 0.0
-        #x_valid, y_valid = get_eval_dataflow()
-        #valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/shuffle_csv/train_k{}.csv.gz'.format(NCSVS - 1)), nrows=34000)
-        #x_valid = df_to_image_array_xd(valid_df, config.IMAGE_SIZE)
-        #y_valid = keras.utils.to_categorical(valid_df.y, num_classes=config.NUM_CLASS)
+        
         x_valid, y_valid = self.data
         valid_predictions = []
         with tqdm.tqdm(total=len(x_valid) // config.INFERENCE_BATCH + 1, **get_tqdm_kwargs()) as pbar:
@@ -181,13 +230,11 @@ class ResnetEvalCallback(Callback):
                 pbar.update()
         valid_predictions = np.array(valid_predictions)
         map3 = mapk(self.valid_df[['y']].values, preds2catids(valid_predictions).values)
-        print('Map3: {:.3f}'.format(map3))
-        #loss = tf.get_default_graph().get_tensor_by_name("tower0/cls_loss/label_loss:0")
-        #print("train loss: ", loss.eval())
+        print('Map3: {:.5f}'.format(map3))
         self.trainer.monitors.put_scalar("Map3", map3)
 
     def _trigger_epoch(self):
-        #if self.epoch_num > 0 and self.epoch_num % 5 == 0:
+        #if self.epoch_num % 10 == 0:
         self._eval()
 
 if __name__ == '__main__':
@@ -222,6 +269,7 @@ if __name__ == '__main__':
 #            predict_many(pred, imgs)
         else:
             if args.evaluate:
+
                 if config.RESNET:
                     pred = OfflinePredictor(PredictConfig(
                         model=ResnetModel(),
@@ -229,8 +277,8 @@ if __name__ == '__main__':
                         input_names=['image'],
                         output_names=get_resnet_model_output_names()))
                     
-                    valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/shuffle_csv2/train_k{}.csv.gz'.format(NCSVS - 1)), nrows=34000)
-                    x_valid = df_to_image_array_xd(valid_df, config.IMAGE_SIZE)
+                    valid_df = pd.read_csv(os.path.join('/data/kaggle/doodle/{}/train_k{}.csv.gz'.format(config.FOLD, (NCSVS - 1))), nrows=34000)
+                    x_valid = df_to_image_array_xd(valid_df, config.IMAGE_SIZE, lw=config.LW)
                     y_valid = keras.utils.to_categorical(valid_df.y, num_classes=config.NUM_CLASS)
                     valid_predictions = []
                     with tqdm.tqdm(total=len(x_valid) // config.INFERENCE_BATCH + 1) as pbar:
@@ -241,12 +289,17 @@ if __name__ == '__main__':
                             end = start + config.INFERENCE_BATCH if start + config.INFERENCE_BATCH < len(x_valid) else len(x_valid)
                             x = x_valid[start:end]
                             final_probs, final_labels = pred(x)
+                            if config.TTA:
+                                x1 = np.array([np.fliplr(_x) for _x in x])
+                                final_probs_TTA, final_labels_TTA = pred(x1)
+                                final_probs = (final_probs + final_probs_TTA) / 2.0
                             valid_predictions.extend(final_probs)
                             pbar.update()
                     valid_predictions = np.array(valid_predictions)
                     map3 = mapk(valid_df[['y']].values, preds2catids(valid_predictions).values)
-                    print('Map3: {:.3f}'.format(map3))
+                    print('Map3: {:.5f}'.format(map3))
             elif args.predict:
+
                 if config.RESNET:
                     pred = OfflinePredictor(PredictConfig(
                         model=ResnetModel(),
@@ -254,10 +307,12 @@ if __name__ == '__main__':
                         input_names=['image'],
                         output_names=get_resnet_model_output_names()))
                     size = config.IMAGE_SIZE
-                    lw = 6
                     predictions = []
-                    test = pd.read_csv(os.path.join(config.BASEDIR, 'test_simplified.csv'))
-                    x_test = df_to_image_array_xd(test, config.IMAGE_SIZE)
+                    if config.RAW:
+                        test = pd.read_csv(os.path.join(config.BASEDIR, 'test_raw.csv'))
+                    else:
+                        test = pd.read_csv(os.path.join(config.BASEDIR, 'test_simplified.csv'))
+                    x_test = df_to_image_array_xd(test, config.IMAGE_SIZE, lw=config.LW)
                     with tqdm.tqdm(total=(len(x_test)) // config.INFERENCE_BATCH + 1) as pbar:
                         start = 0
                         end = 0
@@ -266,6 +321,10 @@ if __name__ == '__main__':
                             end = start + config.INFERENCE_BATCH if start + config.INFERENCE_BATCH < len(x_test) else len(x_test)
                             x = x_test[start:end]
                             final_probs, final_labels = pred(x)
+                            if config.TTA:
+                                x1 = np.array([np.fliplr(_x) for _x in x])
+                                final_probs_TTA, final_labels_TTA = pred(x1)
+                                final_probs = (final_probs + final_probs_TTA) / 2.0
                             predictions.extend(final_probs)
                             pbar.update()
                         predictions = np.array(predictions)
@@ -294,27 +353,27 @@ if __name__ == '__main__':
         elif args.cyclic:
             from custom_utils import CyclicLearningRateSetter
             if config.RESNET:
-                base_lr = 0.0001
-                max_lr = 0.004
-                step_size = (180000 // 64) * 2
-            stepnum = 5000 # step to save model and eval
-            max_epoch = 20 # how many cycle / 4 = 5 cycle (2*step_size = 1 cycle)
+                base_lr = 1e-5
+                max_lr = 2e-3
+                step_size = 800*40
+            stepnum = 800 # step to save model and eval
+            max_epoch = 300 # how many cycle / 4 = 5 cycle (2*step_size = 1 cycle)
             CYCLIC_SCHEDULE = CyclicLearningRateSetter('learning_rate', base_lr=base_lr, max_lr=max_lr, step_size=step_size)
             TRAINING_SCHEDULE = CYCLIC_SCHEDULE
         elif args.auto_reduce:
             stepnum = 800
             base_lr = 2e-3
             min_lr = 1e-5
-            max_epoch = 120
+            max_epoch = 400
             TRAINING_SCHEDULE = ReduceLearningRateOnPlateau('learning_rate', 
-                                        factor=0.1, patience=5, 
+                                        factor=0.5, patience=20, 
                                         base_lr=base_lr, min_lr=min_lr, window_size=800)
         else:
             # heuristic setting for baseline
             if config.RESNET:
                 stepnum = 800
-                max_epoch = 120
-                TRAINING_SCHEDULE = ScheduledHyperParamSetter('learning_rate', [(0, 2e-3), (40, 1e-3), (80, 1e-4)])
+                max_epoch = 400
+                TRAINING_SCHEDULE = ScheduledHyperParamSetter('learning_rate', [(0, 2e-4), (200, 2e-5), (350, 1e-5)])
 
         #==========LR Range Test===============#
         if config.RESNET:

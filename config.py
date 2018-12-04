@@ -5,13 +5,23 @@
 import numpy as np
 
 # for new data
-NORM = 'BN'
-RESNET_MODE = "resnet" #preact
-BATCH = 680
-INFERENCE_BATCH = 128
-IMAGE_SIZE = 64
+ACCU = False
+RAW = False
+TIME_COLOR = True
+AUG_TRAIN = True
+FOLD = "shuffle_csv2" if not RAW else "shuffle_csv_raw"
+FREEZE = False
+TTA = False
+LW = 2
+SEQ = False
+PADDING = False
+NORM = 'BN' 
+RESNET_MODE = "se" #preact
+BATCH = 256
+INFERENCE_BATCH = 256
+IMAGE_SIZE = 144
 NUM_CLASS = 340
-RESNET = True
+RESNET = "ResXt" #ResXt
 # dataset -----------------------
 BASEDIR = '/data/kaggle/doodle/data/'
 TRAIN_DATASET = 'train'
